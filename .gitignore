@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+sgfnd
+
+# Generated outputs
+*.raw
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
