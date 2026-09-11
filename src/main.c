@@ -39,6 +39,7 @@ void print_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    SGFND_LOG_INFO("Starting SGFND");
     printf("SGFND - Synthetic Generative Framework Neural Dynamics\n");
     printf("========================================================\n\n");
 
@@ -57,7 +58,9 @@ int main(int argc, char **argv) {
     sgfnd_nsfw_mode_t nsfw_mode = SGFND_NSFW_FILTER_DISABLED;
     float nsfw_threshold = 0.5f;
 
+    SGFND_LOG_DEBUG("Parsing %d arguments", argc);
     for (int i = 1; i < argc; i++) {
+        SGFND_LOG_DEBUG("Arg %d: %s", i, argv[i]);
         if (strcmp(argv[i], "--large") == 0) mode = SGFND_MODE_LARGE;
         else if (strcmp(argv[i], "--int8") == 0) quant = SGFND_QUANT_INT8;
         else if (strcmp(argv[i], "--int4") == 0) quant = SGFND_QUANT_INT4;

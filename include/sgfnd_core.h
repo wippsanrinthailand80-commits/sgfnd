@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #define SGFND_BRIDGES_SMALL 92
 #define SGFND_BRIDGES_COMPRESSED 46
@@ -13,6 +14,20 @@
 #define SGFND_MAX_TILES 1024
 #define SGFND_LATENT_DIM 512
 #define SGFND_TIMESTEPS 1000
+
+#ifdef DEBUG
+#define SGFND_LOG_DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define SGFND_LOG_INFO(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define SGFND_LOG_WARN(fmt, ...) fprintf(stderr, "[WARN] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define SGFND_LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define SGFND_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "[ASSERT] %s:%d: %s\n", __FILE__, __LINE__, #cond); *(volatile int*)0 = 0; } } while(0)
+#else
+#define SGFND_LOG_DEBUG(fmt, ...) do {} while(0)
+#define SGFND_LOG_INFO(fmt, ...) do {} while(0)
+#define SGFND_LOG_WARN(fmt, ...) fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+#define SGFND_LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define SGFND_ASSERT(cond) do {} while(0)
+#endif
 
 typedef enum {
     SGFND_MODE_SMALL = 0,
