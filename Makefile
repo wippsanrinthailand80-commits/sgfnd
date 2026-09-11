@@ -1,4 +1,5 @@
 CC = gcc
+# Portable x86_64 baseline (for Kaggle); use -march=native for local builds
 CFLAGS = -std=c11 -Wall -Wextra -O3 -march=native -flto -fPIC
 CFLAGS += -Iinclude
 LDFLAGS = -lm -lcurl -lcjson
