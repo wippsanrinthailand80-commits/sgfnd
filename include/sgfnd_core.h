@@ -277,6 +277,16 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
 int sgfnd_model_generate(sgfnd_model_t *model, const sgfnd_prompt_t *prompt, sgfnd_image_t *out_img, int steps);
 int sgfnd_model_save_weights(const sgfnd_model_t *model, const char *path);
 int sgfnd_model_load_weights(sgfnd_model_t *model, const char *path);
+int sgfnd_model_save_full(const sgfnd_model_t *model, const char *path);
+int sgfnd_model_load_full(sgfnd_model_t *model, const char *path);
+
+sgfnd_prompt_t* sgfnd_prompt_create_from_text(const char *text, float weight);
+sgfnd_prompt_t* sgfnd_prompt_create_from_tags(const char **tags, const float *weights, size_t count);
+void sgfnd_prompt_destroy(sgfnd_prompt_t *prompt);
+
+sgfnd_image_t* sgfnd_image_load_from_file(const char *path, uint32_t max_dim);
+int sgfnd_image_resize(sgfnd_image_t *img, uint32_t new_width, uint32_t new_height);
+void sgfnd_image_normalize(sgfnd_image_t *img, float mean, float std);
 
 sgfnd_dataset_t* sgfnd_dataset_create(uint32_t width, uint32_t height, size_t capacity);
 void sgfnd_dataset_destroy(sgfnd_dataset_t *dataset);

@@ -1,5 +1,4 @@
 CC = gcc
-# Portable x86_64 baseline (for Kaggle); use -march=native for local builds
 CFLAGS = -std=c11 -Wall -Wextra -O3 -march=native -flto -fPIC
 CFLAGS += -Iinclude
 LDFLAGS = -lm -lcurl -lcjson
@@ -22,6 +21,7 @@ SOURCES = $(SRC_DIR)/main.c \
           $(SRC_DIR)/color/color_grader.c \
           $(SRC_DIR)/training/training_bot.c \
           $(SRC_DIR)/io/image_io.c \
+          $(SRC_DIR)/io/stb_image_impl.c \
           $(SRC_DIR)/large_model/large_model.c \
           $(SRC_DIR)/generative/latent_diffusion.c \
           $(SRC_DIR)/generative/model_training.c \

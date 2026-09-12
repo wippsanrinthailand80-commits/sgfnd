@@ -183,20 +183,17 @@ int main(int argc, char **argv) {
         printf("Quantization complete.\n");
     }
 
-    sgfnd_prompt_t prompt = {0};
-    prompt.tags = malloc(7 * sizeof(char*));
-    prompt.weights = malloc(7 * sizeof(float));
-    prompt.count = 7;
-    const char *tags[] = {"eyes", "hair", "skin", "clothing", "lighting", "background", "style"};
-    for (int i = 0; i < 7; i++) {
-        prompt.tags[i] = strdup(tags[i]);
-        prompt.weights[i] = 1.0f;
+    const char *prompt_text = "portrait, detailed face, blue eyes, blonde hair, soft lighting, elegant clothing, studio background";
+    sgfnd_prompt_t *prompt = sgfnd_prompt_create_from_text(prompt_text, 1.0f);
+    if (!prompt) {
+        fprintf(stderr, "Failed to create prompt\n");
+        sgfnd_destroy(engine);
+        return 1;
     }
 
-    if (nsfw_filter && sgfnd_nsfw_check_prompt(nsfw_filter, &prompt)) {
+    if (nsfw_filter && sgfnd_nsfw_check_prompt(nsfw_filter, prompt)) {
         printf("\nNSFW Filter: Prompt blocked - contains flagged content\n");
         nsfw_filter->blocked_prompts++;
-        // Continue anyway for demo purposes
     }
 
     if (train_mode && train_url) {
@@ -228,7 +225,7 @@ int main(int argc, char **argv) {
 
         if (model && do_generate) {
             sgfnd_image_t *img = sgfnd_image_create_tiled(512, 512, 4, 64);
-            int ret = sgfnd_model_generate(model, &prompt, img, diff_steps);
+            int ret = sgfnd_model_generate(model, prompt, img, diff_steps);
             if (ret == 0) {
                 printf("Diffusion generation complete (%d steps).\n", diff_steps);
                 if (nsfw_filter) {
@@ -258,12 +255,12 @@ int main(int argc, char **argv) {
                     .tile_callback = tile_write_callback,
                     .user_data = f
                 };
-                sgfnd_render_tiled(engine, &prompt, &config);
+                sgfnd_render_tiled(engine, prompt, &config);
                 fclose(f);
                 printf("Saved tiled output to generated_tiled.raw\n");
             }
         } else {
-            sgfnd_image_t *img = sgfnd_generate_image(engine, &prompt);
+            sgfnd_image_t *img = sgfnd_generate_image(engine, prompt);
             if (img) {
                 printf("Image generated: %ux%u, %d channels, %d-bit\n",
                        img->width, img->height, img->channels, img->bit_depth);
@@ -324,9 +321,7 @@ int main(int argc, char **argv) {
         sgfnd_nsfw_filter_destroy(nsfw_filter);
     }
 
-    for (int i = 0; i < 7; i++) free(prompt.tags[i]);
-    free(prompt.tags);
-    free(prompt.weights);
+    sgfnd_prompt_destroy(prompt);
 
     if (model) sgfnd_model_destroy(model);
     sgfnd_training_bot_destroy_v2(bot);

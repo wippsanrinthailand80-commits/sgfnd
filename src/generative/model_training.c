@@ -53,9 +53,20 @@ static void image_to_latent_input(const sgfnd_image_t *img, float *latent_in) {
     for (size_t i = 0; i < latent_in_dim; i++) {
         latent_in[i] = 0.0f;
     }
-    for (size_t i = 0; i < pixel_count && i < latent_in_dim; i++) {
-        latent_in[i] = img->full_pixels ? img->full_pixels[i] : 0.0f;
+    size_t copy = pixel_count < latent_in_dim ? pixel_count : latent_in_dim;
+    if (img->full_pixels) {
+        for (size_t i = 0; i < copy; i++) {
+            latent_in[i] = img->full_pixels[i];
+        }
     }
+}
+
+static float tag_hash(const char *tag) {
+    unsigned int hash = 5381;
+    for (const char *p = tag; *p; p++) {
+        hash = ((hash << 5) + hash) + (unsigned char)*p;
+    }
+    return (hash % 10000) / 10000.0f;
 }
 
 static void prompt_to_condition(const sgfnd_prompt_t *prompt, float *cond, size_t cond_dim) {
@@ -63,8 +74,20 @@ static void prompt_to_condition(const sgfnd_prompt_t *prompt, float *cond, size_
     for (size_t i = 0; i < cond_dim; i++) {
         cond[i] = 0.0f;
     }
-    for (size_t i = 0; i < prompt->count && i < cond_dim; i++) {
-        cond[i] = prompt->weights[i];
+    if (!prompt->tags) return;
+    
+    size_t tags_to_use = prompt->count < cond_dim ? prompt->count : cond_dim;
+    for (size_t i = 0; i < tags_to_use; i++) {
+        if (prompt->tags[i]) {
+            cond[i] = prompt->weights[i] * tag_hash(prompt->tags[i]);
+        } else {
+            cond[i] = prompt->weights[i] * (1.0f / (i + 1));
+        }
+    }
+    if (prompt->count < cond_dim) {
+        for (size_t i = prompt->count; i < cond_dim; i++) {
+            cond[i] = 0.0f;
+        }
     }
 }
 
@@ -149,39 +172,66 @@ int sgfnd_model_generate(sgfnd_model_t *model, const sgfnd_prompt_t *prompt, sgf
 
     size_t latent_dim = model->latent->dim;
     size_t cond_dim = model->diffusion->cond_embed->layer_dims[0];
+    size_t decoder_out_dim = model->decoder->layer_dims[model->decoder->num_layers];
 
-    float *cond = malloc(cond_dim * sizeof(float));
-    float *latent = malloc(latent_dim * sizeof(float));
+    float *cond = calloc(cond_dim, sizeof(float));
+    float *latent = calloc(latent_dim, sizeof(float));
+    if (!cond || !latent) {
+        free(cond);
+        free(latent);
+        return -1;
+    }
 
     prompt_to_condition(prompt, cond, cond_dim);
 
     sgfnd_diffusion_sample(model->diffusion, cond, latent, steps);
 
-    size_t decoder_out_dim = latent_dim * 4;
-    float *decoded = malloc(decoder_out_dim * sizeof(float));
+    float *decoded = calloc(decoder_out_dim, sizeof(float));
+    if (!decoded) {
+        free(cond);
+        free(latent);
+        return -1;
+    }
     sgfnd_mlp_forward(model->decoder, latent, decoded);
 
     uint32_t w = out_img->width;
     uint32_t h = out_img->height;
     uint8_t c = out_img->channels;
+    size_t pixels_per_channel = w * h;
+    size_t total_pixels = w * h * c;
 
     if (!out_img->full_pixels) {
-        out_img->full_pixels = calloc(w * h * c, sizeof(float));
+        out_img->full_pixels = calloc(total_pixels, sizeof(float));
+        if (!out_img->full_pixels) {
+            free(cond);
+            free(latent);
+            free(decoded);
+            return -1;
+        }
     }
+
+    size_t feature_per_pixel = decoder_out_dim / pixels_per_channel;
+    if (feature_per_pixel == 0) feature_per_pixel = 1;
+    if (feature_per_pixel > 4) feature_per_pixel = 4;
 
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
-            float u = (float)x / w;
-            float v = (float)y / h;
+            size_t pixel_idx = y * w + x;
+            size_t decoded_idx = pixel_idx * feature_per_pixel;
+            size_t out_idx = (y * w + x) * c;
 
-            size_t idx = (y * w + x) * c;
-            float base = decoded[(size_t)((u + v * 0.1f) * decoder_out_dim) % decoder_out_dim];
-            base = fmaxf(0.0f, fminf(1.0f, base));
+            float r = (decoded_idx < decoder_out_dim) ? decoded[decoded_idx] : 0.0f;
+            float g = (decoded_idx + 1 < decoder_out_dim) ? decoded[decoded_idx + 1] : r * 0.85f;
+            float b = (decoded_idx + 2 < decoder_out_dim) ? decoded[decoded_idx + 2] : r * 0.7f;
 
-            out_img->full_pixels[idx + 0] = base;
-            out_img->full_pixels[idx + 1] = base * 0.9f;
-            out_img->full_pixels[idx + 2] = base * 0.8f;
-            out_img->full_pixels[idx + 3] = 1.0f;
+            r = fmaxf(0.0f, fminf(1.0f, r));
+            g = fmaxf(0.0f, fminf(1.0f, g));
+            b = fmaxf(0.0f, fminf(1.0f, b));
+
+            out_img->full_pixels[out_idx + 0] = r;
+            out_img->full_pixels[out_idx + 1] = g;
+            out_img->full_pixels[out_idx + 2] = b;
+            if (c > 3) out_img->full_pixels[out_idx + 3] = 1.0f;
         }
     }
 
@@ -308,4 +358,250 @@ int sgfnd_dataset_get_batch(const sgfnd_dataset_t *dataset, size_t batch_size, s
         out_prompts[i] = &dataset->prompts[idx];
     }
     return batch_size;
+}
+
+int sgfnd_model_save_full(const sgfnd_model_t *model, const char *path) {
+    if (!model || !path) return -1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    uint32_t magic = 0x5347464E;
+    fwrite(&magic, sizeof(uint32_t), 1, f);
+
+    uint32_t version = 2;
+    fwrite(&version, sizeof(uint32_t), 1, f);
+
+    size_t latent_dim = model->latent->dim;
+    fwrite(&latent_dim, sizeof(size_t), 1, f);
+
+    fwrite(model->latent->mu, sizeof(float), latent_dim, f);
+    fwrite(model->latent->logvar, sizeof(float), latent_dim, f);
+
+    size_t step_count = model->step_count;
+    fwrite(&step_count, sizeof(size_t), 1, f);
+    fwrite(&model->learning_rate, sizeof(float), 1, f);
+
+    size_t opt_state_size = 0;
+    opt_state_size += latent_dim;
+    opt_state_size += latent_dim * 2;
+    opt_state_size += 512 * 512 * 3;
+    fwrite(&opt_state_size, sizeof(size_t), 1, f);
+    if (model->optimizer_state) {
+        fwrite(model->optimizer_state, sizeof(float), opt_state_size, f);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int sgfnd_model_load_full(sgfnd_model_t *model, const char *path) {
+    if (!model || !path) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    uint32_t magic, version;
+    fread(&magic, sizeof(uint32_t), 1, f);
+    fread(&version, sizeof(uint32_t), 1, f);
+
+    if (magic != 0x5347464E) {
+        fclose(f);
+        return -1;
+    }
+
+    size_t latent_dim;
+    fread(&latent_dim, sizeof(size_t), 1, f);
+
+    if (latent_dim != model->latent->dim) {
+        fclose(f);
+        return -1;
+    }
+
+    fread(model->latent->mu, sizeof(float), latent_dim, f);
+    fread(model->latent->logvar, sizeof(float), latent_dim, f);
+
+    size_t step_count;
+    fread(&step_count, sizeof(size_t), 1, f);
+    fread(&model->learning_rate, sizeof(float), 1, f);
+    model->step_count = step_count;
+
+    size_t opt_state_size;
+    fread(&opt_state_size, sizeof(size_t), 1, f);
+    if (model->optimizer_state && opt_state_size > 0) {
+        fread(model->optimizer_state, sizeof(float), opt_state_size, f);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+sgfnd_prompt_t* sgfnd_prompt_create_from_text(const char *text, float weight) {
+    if (!text) return NULL;
+
+    sgfnd_prompt_t *prompt = calloc(1, sizeof(sgfnd_prompt_t));
+    if (!prompt) return NULL;
+
+    char *text_copy = strdup(text);
+    if (!text_copy) {
+        free(prompt);
+        return NULL;
+    }
+
+    size_t count = 1;
+    for (char *p = text_copy; *p; p++) {
+        if (*p == ',' || *p == ';') count++;
+    }
+
+    prompt->tags = calloc(count, sizeof(char*));
+    prompt->weights = calloc(count, sizeof(float));
+    if (!prompt->tags || !prompt->weights) {
+        free(text_copy);
+        free(prompt->tags);
+        free(prompt->weights);
+        free(prompt);
+        return NULL;
+    }
+
+    prompt->count = count;
+    char *saveptr = NULL;
+    char *token = strtok_r(text_copy, ",;", &saveptr);
+    for (size_t i = 0; i < count && token; i++) {
+        while (*token == ' ' || *token == '\t') token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && (*end == ' ' || *end == '\t')) *end-- = '\0';
+        prompt->tags[i] = strdup(token);
+        prompt->weights[i] = weight;
+        token = strtok_r(NULL, ",;", &saveptr);
+    }
+    free(text_copy);
+    return prompt;
+}
+
+sgfnd_prompt_t* sgfnd_prompt_create_from_tags(const char **tags, const float *weights, size_t count) {
+    if (!tags || !weights || count == 0) return NULL;
+
+    sgfnd_prompt_t *prompt = calloc(1, sizeof(sgfnd_prompt_t));
+    if (!prompt) return NULL;
+
+    prompt->tags = calloc(count, sizeof(char*));
+    prompt->weights = calloc(count, sizeof(float));
+    if (!prompt->tags || !prompt->weights) {
+        free(prompt->tags);
+        free(prompt->weights);
+        free(prompt);
+        return NULL;
+    }
+
+    prompt->count = count;
+    for (size_t i = 0; i < count; i++) {
+        prompt->tags[i] = tags[i] ? strdup(tags[i]) : NULL;
+        prompt->weights[i] = weights[i];
+    }
+    return prompt;
+}
+
+void sgfnd_prompt_destroy(sgfnd_prompt_t *prompt) {
+    if (!prompt) return;
+    for (size_t i = 0; i < prompt->count; i++) {
+        free(prompt->tags[i]);
+    }
+    free(prompt->tags);
+    free(prompt->weights);
+    free(prompt);
+}
+
+#include "stb_image.h"
+
+sgfnd_image_t* sgfnd_image_load_from_file(const char *path, uint32_t max_dim) {
+    if (!path) return NULL;
+
+    int w, h, c;
+    unsigned char *data = stbi_load(path, &w, &h, &c, 4);
+    if (!data) return NULL;
+
+    float scale = 1.0f;
+    if (max_dim > 0 && (w > max_dim || h > max_dim)) {
+        scale = (float)max_dim / (w > h ? w : h);
+    }
+
+    uint32_t new_w = (uint32_t)(w * scale);
+    uint32_t new_h = (uint32_t)(h * scale);
+
+    sgfnd_image_t *img = sgfnd_image_create_tiled(new_w, new_h, 4, 64);
+    if (!img) {
+        stbi_image_free(data);
+        return NULL;
+    }
+
+    for (uint32_t y = 0; y < new_h; y++) {
+        for (uint32_t x = 0; x < new_w; x++) {
+            uint32_t src_x = (uint32_t)(x / scale);
+            uint32_t src_y = (uint32_t)(y / scale);
+            if (src_x >= (uint32_t)w) src_x = w - 1;
+            if (src_y >= (uint32_t)h) src_y = h - 1;
+
+            size_t src_idx = (src_y * w + src_x) * 4;
+            size_t dst_idx = (y * new_w + x) * 4;
+
+            img->full_pixels[dst_idx + 0] = data[src_idx + 0] / 255.0f;
+            img->full_pixels[dst_idx + 1] = data[src_idx + 1] / 255.0f;
+            img->full_pixels[dst_idx + 2] = data[src_idx + 2] / 255.0f;
+            img->full_pixels[dst_idx + 3] = data[src_idx + 3] / 255.0f;
+        }
+    }
+
+    stbi_image_free(data);
+    return img;
+}
+
+int sgfnd_image_resize(sgfnd_image_t *img, uint32_t new_width, uint32_t new_height) {
+    if (!img || new_width == 0 || new_height == 0) return -1;
+    if (img->width == new_width && img->height == new_height) return 0;
+
+    float *new_pixels = calloc(new_width * new_height * img->channels, sizeof(float));
+    if (!new_pixels) return -1;
+
+    float scale_x = (float)img->width / new_width;
+    float scale_y = (float)img->height / new_height;
+
+    for (uint32_t y = 0; y < new_height; y++) {
+        for (uint32_t x = 0; x < new_width; x++) {
+            float src_x = x * scale_x;
+            float src_y = y * scale_y;
+            uint32_t x0 = (uint32_t)src_x;
+            uint32_t y0 = (uint32_t)src_y;
+            uint32_t x1 = (x0 + 1 < img->width) ? x0 + 1 : x0;
+            uint32_t y1 = (y0 + 1 < img->height) ? y0 + 1 : y0;
+            float fx = src_x - x0;
+            float fy = src_y - y0;
+
+            for (uint8_t c = 0; c < img->channels; c++) {
+                float v00 = img->full_pixels[(y0 * img->width + x0) * img->channels + c];
+                float v10 = img->full_pixels[(y0 * img->width + x1) * img->channels + c];
+                float v01 = img->full_pixels[(y1 * img->width + x0) * img->channels + c];
+                float v11 = img->full_pixels[(y1 * img->width + x1) * img->channels + c];
+
+                float v0 = v00 + fx * (v10 - v00);
+                float v1 = v01 + fx * (v11 - v01);
+                float v = v0 + fy * (v1 - v0);
+
+                new_pixels[(y * new_width + x) * img->channels + c] = v;
+            }
+        }
+    }
+
+    free(img->full_pixels);
+    img->full_pixels = new_pixels;
+    img->width = new_width;
+    img->height = new_height;
+    return 0;
+}
+
+void sgfnd_image_normalize(sgfnd_image_t *img, float mean, float std) {
+    if (!img || !img->full_pixels) return;
+    size_t total = img->width * img->height * img->channels;
+    for (size_t i = 0; i < total; i++) {
+        img->full_pixels[i] = (img->full_pixels[i] - mean) / std;
+    }
 }

@@ -10,6 +10,8 @@
 #include <time.h>
 #include <math.h>
 
+#include "stb_image.h"
+
 #define METADATA_DIR "training_metadata"
 #define MAX_URL_LEN 2048
 
@@ -62,6 +64,8 @@ static int save_image_to_disk(const char *path, const unsigned char *data, size_
     return 0;
 }
 
+static sgfnd_image_t* load_image_from_memory(const unsigned char *data, size_t size) __attribute__((unused));
+
 static sgfnd_image_t* load_image_from_memory(const unsigned char *data, size_t size) {
     sgfnd_image_t *img = sgfnd_image_create_tiled(512, 512, 4, 64);
     if (!img) return NULL;
@@ -70,6 +74,55 @@ static sgfnd_image_t* load_image_from_memory(const unsigned char *data, size_t s
     for (size_t i = 0; i < pixel_count && i < size; i++) {
         img->full_pixels[i] = data[i] / 255.0f;
     }
+    return img;
+}
+
+static sgfnd_image_t* load_image_from_memory_stb(const unsigned char *data, size_t size) {
+    int w, h, c;
+    unsigned char *pixels = stbi_load_from_memory(data, (int)size, &w, &h, &c, 4);
+    if (!pixels) return NULL;
+
+    sgfnd_image_t *img = sgfnd_image_create_tiled(512, 512, 4, 64);
+    if (!img) {
+        stbi_image_free(pixels);
+        return NULL;
+    }
+
+    if (w != 512 || h != 512) {
+        float scale_x = (float)w / 512.0f;
+        float scale_y = (float)h / 512.0f;
+        for (uint32_t y = 0; y < 512; y++) {
+            for (uint32_t x = 0; x < 512; x++) {
+                float src_x = x * scale_x;
+                float src_y = y * scale_y;
+                uint32_t x0 = (uint32_t)src_x;
+                uint32_t y0 = (uint32_t)src_y;
+                uint32_t x1 = fminf(w - 1, x0 + 1);
+                uint32_t y1 = fminf(h - 1, y0 + 1);
+                (void)x1; (void)y1;
+                float fx = src_x - x0, fy = src_y - y0;
+
+                for (int ch = 0; ch < 4; ch++) {
+                    float v00 = pixels[(y0 * w + x0) * 4 + ch] / 255.0f;
+                    float v10 = pixels[(y0 * w + x1) * 4 + ch] / 255.0f;
+                    float v01 = pixels[(y1 * w + x0) * 4 + ch] / 255.0f;
+                    float v11 = pixels[(y1 * w + x1) * 4 + ch] / 255.0f;
+
+                    float v0 = v00 + fx * (v10 - v00);
+                    float v1 = v01 + fx * (v11 - v01);
+                    float v = v0 + fy * (v1 - v0);
+
+                    img->full_pixels[(y * 512 + x) * 4 + ch] = v;
+                }
+            }
+        }
+    } else {
+        for (size_t i = 0; i < 512 * 512 * 4; i++) {
+            img->full_pixels[i] = pixels[i] / 255.0f;
+        }
+    }
+
+    stbi_image_free(pixels);
     return img;
 }
 
@@ -191,10 +244,13 @@ int sgfnd_training_bot_fetch_and_process(sgfnd_training_bot_t *bot, const char *
     snprintf(filename, sizeof(filename), "%s/training_%zu.png", bot->storage_path, (size_t)time(NULL));
     save_image_to_disk(filename, (unsigned char*)chunk.data, chunk.size);
 
-    sgfnd_image_t *img = load_image_from_memory((unsigned char*)chunk.data, chunk.size);
+    sgfnd_image_t *img = load_image_from_memory_stb((unsigned char*)chunk.data, chunk.size);
     free(chunk.data);
 
     if (!img) return -1;
+
+    sgfnd_image_resize(img, 512, 512);
+    sgfnd_image_normalize(img, 0.5f, 0.5f);
 
     int ret = sgfnd_color_grader_train(grader, img);
 
@@ -230,27 +286,23 @@ int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *ur
     snprintf(filename, sizeof(filename), "%s/training_%zu.png", bot->storage_path, (size_t)time(NULL));
     save_image_to_disk(filename, (unsigned char*)chunk.data, chunk.size);
 
-    sgfnd_image_t *img = load_image_from_memory((unsigned char*)chunk.data, chunk.size);
+    sgfnd_image_t *img = load_image_from_memory_stb((unsigned char*)chunk.data, chunk.size);
     free(chunk.data);
 
     if (!img) return -1;
+
+    sgfnd_image_resize(img, 512, 512);
+    sgfnd_image_normalize(img, 0.5f, 0.5f);
 
     if (grader) {
         sgfnd_color_grader_train(grader, img);
     }
 
-    sgfnd_prompt_t prompt = {0};
-    prompt.tags = malloc(7 * sizeof(char*));
-    prompt.weights = malloc(7 * sizeof(float));
-    prompt.count = 7;
-    const char *tags[] = {"eyes", "hair", "skin", "clothing", "lighting", "background", "style"};
-    for (int i = 0; i < 7; i++) {
-        prompt.tags[i] = strdup(tags[i]);
-        prompt.weights[i] = 1.0f;
-    }
+    sgfnd_prompt_t *prompt = sgfnd_prompt_create_from_text("eyes, hair, skin, clothing, lighting, background, style", 1.0f);
+    if (!prompt) return -1;
 
     sgfnd_training_step_t step_info;
-    int ret = sgfnd_model_train_step(model, img, &prompt, &step_info);
+    int ret = sgfnd_model_train_step(model, img, prompt, &step_info);
 
     bot->avg_loss = (bot->avg_loss * bot->images_processed + step_info.loss) / (bot->images_processed + 1);
     bot->images_processed++;
@@ -262,9 +314,7 @@ int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *ur
         sgfnd_latent_destroy(latent);
     }
 
-    for (int i = 0; i < 7; i++) free(prompt.tags[i]);
-    free(prompt.tags);
-    free(prompt.weights);
+    sgfnd_prompt_destroy(prompt);
 
     sgfnd_image_free(img);
     return ret;
