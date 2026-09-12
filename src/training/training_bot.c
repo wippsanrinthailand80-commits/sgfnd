@@ -267,18 +267,23 @@ int sgfnd_training_bot_fetch_and_process(sgfnd_training_bot_t *bot, const char *
     return ret;
 }
 
-int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *url, sgfnd_model_t *model, sgfnd_color_grader_t *grader) {
+int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *url, sgfnd_model_t *model, sgfnd_color_grader_t *grader, sgfnd_training_step_t *step_info) {
     if (!bot || !url || !model) return -1;
 
     struct MemoryBuffer chunk = {0};
     curl_easy_setopt(bot->curl, CURLOPT_URL, url);
     curl_easy_setopt(bot->curl, CURLOPT_WRITEDATA, &chunk);
+    curl_easy_setopt(bot->curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(bot->curl, CURLOPT_FOLLOWLOCATION, 1L);
 
+    fprintf(stderr, "[DEBUG] Fetching from URL: %s\n", url);
     CURLcode res = curl_easy_perform(bot->curl);
     if (res != CURLE_OK) {
+        fprintf(stderr, "[DEBUG] curl_easy_perform failed: %s\n", curl_easy_strerror(res));
         free(chunk.data);
         return -1;
     }
+    fprintf(stderr, "[DEBUG] Downloaded %zu bytes\n", chunk.size);
 
     bot->images_fetched++;
 
@@ -289,7 +294,18 @@ int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *ur
     sgfnd_image_t *img = load_image_from_memory_stb((unsigned char*)chunk.data, chunk.size);
     free(chunk.data);
 
-    if (!img) return -1;
+    fprintf(stderr, "[DEBUG] Image loaded: %p\n", (void*)img);
+    if (!img) {
+        fprintf(stderr, "[DEBUG] Failed to load image\n");
+        return -1;
+    }
+
+    // Validate image before training
+    if (!sgfnd_image_validate_for_training(img)) {
+        fprintf(stderr, "[DEBUG] Image validation failed\n");
+        sgfnd_image_free(img);
+        return -1;
+    }
 
     sgfnd_image_resize(img, 512, 512);
     sgfnd_image_normalize(img, 0.5f, 0.5f);
@@ -301,10 +317,9 @@ int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *ur
     sgfnd_prompt_t *prompt = sgfnd_prompt_create_from_text("eyes, hair, skin, clothing, lighting, background, style", 1.0f);
     if (!prompt) return -1;
 
-    sgfnd_training_step_t step_info;
-    int ret = sgfnd_model_train_step(model, img, prompt, &step_info);
+    int ret = sgfnd_model_train_step(model, img, prompt, step_info);
 
-    bot->avg_loss = (bot->avg_loss * bot->images_processed + step_info.loss) / (bot->images_processed + 1);
+    bot->avg_loss = (bot->avg_loss * bot->images_processed + step_info->loss) / (bot->images_processed + 1);
     bot->images_processed++;
 
     if (bot->dataset) {
@@ -434,4 +449,100 @@ float sgfnd_training_bot_get_avg_loss(const sgfnd_training_bot_t *bot) {
 
 sgfnd_dataset_t* sgfnd_training_bot_get_dataset(const sgfnd_training_bot_t *bot) {
     return bot ? bot->dataset : NULL;
+}
+
+static int train_single_image(sgfnd_training_bot_t *bot, sgfnd_image_t *img, sgfnd_model_t *model, sgfnd_color_grader_t *grader, sgfnd_training_step_t *step_info) {
+    if (!img) return -1;
+    
+    if (!sgfnd_image_validate_for_training(img)) {
+        fprintf(stderr, "[TRAIN] Image validation failed\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[TRAIN] Training on image: %ux%u\n", img->width, img->height);
+    
+    if (grader) {
+        sgfnd_color_grader_train(grader, img);
+    }
+
+    sgfnd_prompt_t *prompt = sgfnd_prompt_create_from_text("eyes, hair, skin, clothing, lighting, background, style", 1.0f);
+    if (!prompt) return -1;
+
+    int ret = sgfnd_model_train_step(model, img, prompt, step_info);
+
+    if (bot->dataset) {
+        sgfnd_latent_t *latent = sgfnd_latent_create(model->latent->dim);
+        sgfnd_latent_encode(latent, img->full_pixels, 512 * 4);
+        sgfnd_dataset_add(bot->dataset, img, latent, "auto-trained", "diffusion_training");
+        sgfnd_latent_destroy(latent);
+    }
+
+    sgfnd_prompt_destroy(prompt);
+    sgfnd_image_free(img);
+    fprintf(stderr, "[TRAIN] Image training complete, loss=%.4f\n", step_info ? step_info->loss : -1.0f);
+    return ret;
+}
+
+int sgfnd_training_bot_train_from_file(sgfnd_training_bot_t *bot, const char *filepath, sgfnd_model_t *model, sgfnd_color_grader_t *grader, sgfnd_training_step_t *step_info) {
+    if (!bot || !filepath || !model) return -1;
+
+    fprintf(stderr, "[TRAIN] Loading image from file: %s\n", filepath);
+    sgfnd_image_t *img = sgfnd_image_load_from_file(filepath, 512);
+    if (!img) {
+        fprintf(stderr, "[TRAIN] Failed to load image from %s\n", filepath);
+        return -1;
+    }
+
+    fprintf(stderr, "[TRAIN] Loaded image: %ux%u, channels=%u\n", img->width, img->height, img->channels);
+
+    sgfnd_image_normalize(img, 0.5f, 0.5f);
+    fprintf(stderr, "[TRAIN] Normalized image: range=[%.4f, %.4f]\n", 
+        img->full_pixels[0], img->full_pixels[1]); // Just first two pixels as sample
+
+    return train_single_image(bot, img, model, grader, step_info);
+}
+
+int sgfnd_training_bot_train_from_directory(sgfnd_training_bot_t *bot, const char *dirpath, sgfnd_model_t *model, sgfnd_color_grader_t *grader, int epochs, int steps) {
+    if (!bot || !dirpath || !model) return -1;
+
+    DIR *dir = opendir(dirpath);
+    if (!dir) {
+        fprintf(stderr, "[TRAIN] Failed to open directory: %s\n", dirpath);
+        return -1;
+    }
+
+    struct dirent *entry;
+    char filepath[1024];
+    int images_processed = 0;
+
+    for (int epoch = 0; epoch < epochs; epoch++) {
+        fprintf(stderr, "[TRAIN] Epoch %d/%d\n", epoch + 1, epochs);
+        images_processed = 0;
+
+        rewinddir(dir);
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type != DT_REG) continue;
+
+            const char *ext = strrchr(entry->d_name, '.');
+            if (!ext) continue;
+            if (strcasecmp(ext, ".png") != 0 && strcasecmp(ext, ".jpg") != 0 && 
+                strcasecmp(ext, ".jpeg") != 0 && strcasecmp(ext, ".bmp") != 0) continue;
+
+            snprintf(filepath, sizeof(filepath), "%s/%s", dirpath, entry->d_name);
+            fprintf(stderr, "[TRAIN] Processing: %s\n", filepath);
+
+            sgfnd_training_step_t step_info = {0};
+            int ret = sgfnd_training_bot_train_from_file(bot, filepath, model, NULL, &step_info);
+            if (ret == 0) {
+                images_processed++;
+                fprintf(stderr, "[TRAIN] Epoch %d, Image %d: loss=%.6f\n", epoch + 1, images_processed, step_info.loss);
+            } else {
+                fprintf(stderr, "[TRAIN] Failed to process %s\n", entry->d_name);
+            }
+        }
+    }
+
+    closedir(dir);
+    fprintf(stderr, "[TRAIN] Total images processed: %d\n", images_processed);
+    return images_processed > 0 ? 0 : -1;
 }

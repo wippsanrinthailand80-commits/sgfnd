@@ -34,6 +34,7 @@ void print_usage(const char *prog) {
     printf("  --lr F            Learning rate (default: 1e-4)\n");
     printf("  --batch N         Batch size (default: 4)\n");
     printf("  --url URL         Fetch and train from URL\n");
+    printf("  --train-dir DIR   Train from local image directory\n");
     printf("  --nsfw MODE       NSFW filter: disabled|enabled|strict (default: disabled)\n");
     printf("  --nsfw-thresh F   NSFW threshold 0.0-1.0 (default: 0.5)\n");
 }
@@ -55,6 +56,7 @@ int main(int argc, char **argv) {
     float lr = 1e-4f;
     int batch_size = 4;
     const char *train_url = NULL;
+    const char *train_dir = NULL;
     sgfnd_nsfw_mode_t nsfw_mode = SGFND_NSFW_FILTER_DISABLED;
     float nsfw_threshold = 0.5f;
 
@@ -73,6 +75,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) lr = atof(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) batch_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) train_url = argv[++i];
+        else if (strcmp(argv[i], "--train-dir") == 0 && i + 1 < argc) train_dir = argv[++i];
         else if (strcmp(argv[i], "--nsfw") == 0 && i + 1 < argc) {
             const char *m = argv[++i];
             if (strcmp(m, "enabled") == 0) nsfw_mode = SGFND_NSFW_FILTER_ENABLED;
@@ -200,7 +203,7 @@ int main(int argc, char **argv) {
         printf("\nFetching and training from URL: %s\n", train_url);
         for (int epoch = 0; epoch < epochs; epoch++) {
             sgfnd_training_step_t step_info = {0};
-            int ret = sgfnd_training_bot_fetch_and_train(bot, train_url, model, grader);
+            int ret = sgfnd_training_bot_fetch_and_train(bot, train_url, model, grader, &step_info);
             if (ret == 0) {
                 printf("  Epoch %d/%d: loss=%.6f (recon=%.6f, kl=%.6f, adv=%.6f)\n",
                        epoch + 1, epochs, step_info.loss, step_info.recon_loss, step_info.kl_loss, step_info.adv_loss);
@@ -209,6 +212,23 @@ int main(int argc, char **argv) {
             }
         }
         printf("Training complete. Avg loss: %.6f\n", sgfnd_training_bot_get_avg_loss(bot));
+
+        if (sgfnd_training_bot_get_dataset(bot) && sgfnd_training_bot_get_dataset(bot)->count > 0) {
+            printf("Augmenting dataset...\n");
+            sgfnd_training_bot_augment_dataset(bot, dataset);
+            printf("Dataset size: %zu\n", dataset->count);
+        }
+
+        sgfnd_model_save_weights(model, "sgfnd_model_weights.bin");
+        printf("Model weights saved.\n");
+    } else if (train_mode && train_dir) {
+        printf("\nTraining from local directory: %s\n", train_dir);
+        int ret = sgfnd_training_bot_train_from_directory(bot, train_dir, model, grader, epochs, diff_steps);
+        if (ret == 0) {
+            printf("Local training complete.\n");
+        } else {
+            fprintf(stderr, "Local training failed or no images found.\n");
+        }
 
         if (sgfnd_training_bot_get_dataset(bot) && sgfnd_training_bot_get_dataset(bot)->count > 0) {
             printf("Augmenting dataset...\n");

@@ -97,12 +97,23 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
     size_t latent_dim = model->latent->dim;
     size_t cond_dim = model->diffusion->cond_embed->layer_dims[0];
 
-    float *latent_input = malloc(latent_dim * 2 * sizeof(float));
-    float *cond = malloc(cond_dim * sizeof(float));
-    float *recon = malloc(latent_dim * 4 * sizeof(float));
-    float *disc_out = malloc(sizeof(float));
+    float *latent_input = calloc(latent_dim * 2, sizeof(float));
+    float *cond = calloc(cond_dim, sizeof(float));
+    float *recon = calloc(latent_dim * 4, sizeof(float));
+    float *disc_out = calloc(1, sizeof(float));
+    if (!latent_input || !cond || !recon || !disc_out) {
+        free(latent_input);
+        free(cond);
+        free(recon);
+        free(disc_out);
+        return -1;
+    }
 
     image_to_latent_input(img, latent_input);
+    // Initialize logvar part (second half) to -1.0 for stable KL
+    for (size_t i = 0; i < latent_dim; i++) {
+        latent_input[latent_dim + i] = -1.0f;
+    }
     prompt_to_condition(prompt, cond, cond_dim);
 
     sgfnd_mlp_forward(model->encoder, latent_input, model->latent->mu);
@@ -126,24 +137,44 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
 
     float kl_loss = 0.0f;
     for (size_t i = 0; i < latent_dim; i++) {
-        kl_loss += -0.5f * (1.0f + model->latent->logvar[i] - model->latent->mu[i] * model->latent->mu[i] - expf(model->latent->logvar[i]));
+        float logvar = fmaxf(-10.0f, fminf(10.0f, model->latent->logvar[i]));
+        float mu_sq = model->latent->mu[i] * model->latent->mu[i];
+        kl_loss += -0.5f * (1.0f + logvar - mu_sq - expf(logvar));
     }
     kl_loss /= latent_dim;
 
     sgfnd_mlp_forward(model->discriminator, recon, disc_out);
-    float adv_loss = -logf(fmaxf(1e-8f, disc_out[0]));
+    float disc_val = fmaxf(1e-8f, fminf(1.0f - 1e-8f, disc_out[0]));
+    float adv_loss = -logf(disc_val);
 
     float total_loss = diff_loss + recon_loss + 0.1f * kl_loss + 0.01f * adv_loss;
 
-    float *grad_recon = malloc(latent_dim * 4 * sizeof(float));
+    // Clamp total loss to prevent instability
+    if (isnan(total_loss) || isinf(total_loss)) {
+        fprintf(stderr, "[TRAIN] NaN/Inf detected: diff=%.4f recon=%.4f kl=%.4f adv=%.4f\n", diff_loss, recon_loss, kl_loss, adv_loss);
+        total_loss = 1e6f;
+    } else if (total_loss > 1e6f) {
+        fprintf(stderr, "[TRAIN] High loss clamped: diff=%.4f recon=%.4f kl=%.4f adv=%.4f\n", diff_loss, recon_loss, kl_loss, adv_loss);
+        total_loss = 1e6f;
+    }
+
+    float *grad_recon = calloc(latent_dim * 4, sizeof(float));
     for (size_t i = 0; i < latent_dim * 4; i++) {
         float target = (i < latent_dim * 2) ? latent_input[i] : 0.0f;
-        grad_recon[i] = 2.0f * (recon[i] - target) / (latent_dim * 4);
+        float diff = recon[i] - target;
+        // Clip gradient
+        if (diff > 100.0f) diff = 100.0f;
+        if (diff < -100.0f) diff = -100.0f;
+        grad_recon[i] = 2.0f * diff / (latent_dim * 4);
     }
     sgfnd_mlp_backward(model->decoder, model->latent->latent, grad_recon, model->learning_rate);
 
-    float *grad_disc = malloc(sizeof(float));
-    grad_disc[0] = -1.0f / fmaxf(1e-8f, disc_out[0]);
+    float *grad_disc = calloc(1, sizeof(float));
+    // Clamp discriminator gradient to prevent explosion
+    float disc_grad = -1.0f / fmaxf(1e-4f, fminf(1.0f - 1e-4f, disc_out[0]));
+    if (disc_grad > 100.0f) disc_grad = 100.0f;
+    if (disc_grad < -100.0f) disc_grad = -100.0f;
+    grad_disc[0] = disc_grad;
     sgfnd_mlp_backward(model->discriminator, recon, grad_disc, model->learning_rate);
 
     free(latent_input);
@@ -604,4 +635,70 @@ void sgfnd_image_normalize(sgfnd_image_t *img, float mean, float std) {
     for (size_t i = 0; i < total; i++) {
         img->full_pixels[i] = (img->full_pixels[i] - mean) / std;
     }
+}
+
+int sgfnd_image_validate_for_training(const sgfnd_image_t *img) {
+    if (!img) {
+        fprintf(stderr, "[VALIDATION] Image is NULL\n");
+        return 0;
+    }
+
+    if (!img->full_pixels) {
+        fprintf(stderr, "[VALIDATION] Image has no pixel data\n");
+        return 0;
+    }
+
+    if (img->width == 0 || img->height == 0) {
+        fprintf(stderr, "[VALIDATION] Image has zero dimensions: %ux%u\n", img->width, img->height);
+        return 0;
+    }
+
+    if (img->channels < 3 || img->channels > 4) {
+        fprintf(stderr, "[VALIDATION] Invalid channel count: %u (expected 3 or 4)\n", img->channels);
+        return 0;
+    }
+
+    size_t total = img->width * img->height * img->channels;
+    
+    float min_val = 1.0f, max_val = 0.0f, sum = 0.0f;
+    float first_val = img->full_pixels[0];
+    int all_same = 1;
+    
+    for (size_t i = 0; i < total; i++) {
+        float v = img->full_pixels[i];
+        if (v < min_val) min_val = v;
+        if (v > max_val) max_val = v;
+        sum += v;
+        if (i > 0 && fabsf(v - first_val) > 1e-6f) {
+            all_same = 0;
+        }
+    }
+    
+    float mean = sum / total;
+    
+    if (all_same) {
+        fprintf(stderr, "[VALIDATION] Image is uniform (all pixels = %.4f)\n", first_val);
+        return 0;
+    }
+    
+    if (max_val <= 0.0f) {
+        fprintf(stderr, "[VALIDATION] Image has no positive values (max = %.4f)\n", max_val);
+        return 0;
+    }
+    
+    float range = max_val - min_val;
+    if (range < 0.01f) {
+        fprintf(stderr, "[VALIDATION] Image has very low dynamic range: %.4f\n", range);
+        return 0;
+    }
+    
+    if (min_val < -10.0f || max_val > 10.0f) {
+        fprintf(stderr, "[VALIDATION] Image values out of expected range [min=%.4f, max=%.4f]\n", min_val, max_val);
+        return 0;
+    }
+    
+    fprintf(stderr, "[VALIDATION] Image OK: %ux%u, channels=%u, range=[%.4f, %.4f], mean=%.4f\n",
+            img->width, img->height, img->channels, min_val, max_val, mean);
+    
+    return 1;
 }

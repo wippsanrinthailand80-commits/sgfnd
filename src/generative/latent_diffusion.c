@@ -119,10 +119,17 @@ void sgfnd_linear_destroy(sgfnd_linear_t *layer) {
 
 void sgfnd_linear_forward(const sgfnd_linear_t *layer, const float *input, float *output) {
     if (!layer || !input || !output) return;
+    if (layer->in_dim == 0 || layer->out_dim == 0) return;
+    
     for (size_t j = 0; j < layer->out_dim; j++) {
         float sum = 0.0f;
         for (size_t i = 0; i < layer->in_dim; i++) {
-            sum += input[i] * layer->weights[i * layer->out_dim + j];
+            size_t w_idx = i * layer->out_dim + j;
+            if (w_idx >= layer->in_dim * layer->out_dim) {
+                fprintf(stderr, "[ERROR] Linear forward: weight index out of bounds\n");
+                return;
+            }
+            sum += input[i] * layer->weights[w_idx];
         }
         if (layer->use_bias) sum += layer->bias[j];
         output[j] = sum;
@@ -132,27 +139,45 @@ void sgfnd_linear_forward(const sgfnd_linear_t *layer, const float *input, float
 void sgfnd_linear_backward(sgfnd_linear_t *layer, const float *input, const float *grad_output, float *grad_input, float lr) {
     if (!layer || !input || !grad_output) return;
 
+    // Sanity check dimensions
+    if (layer->in_dim == 0 || layer->out_dim == 0) {
+        fprintf(stderr, "[ERROR] Linear layer has zero dimensions\n");
+        return;
+    }
+
     for (size_t i = 0; i < layer->in_dim; i++) {
         float gi = 0.0f;
         for (size_t j = 0; j < layer->out_dim; j++) {
-            gi += grad_output[j] * layer->weights[i * layer->out_dim + j];
-            layer->grad_w[i * layer->out_dim + j] += input[i] * grad_output[j];
+            size_t w_idx = i * layer->out_dim + j;
+            // Bounds check
+            if (w_idx >= layer->in_dim * layer->out_dim) {
+                fprintf(stderr, "[ERROR] Weight index out of bounds: %zu >= %zu\n", w_idx, layer->in_dim * layer->out_dim);
+                return;
+            }
+            gi += grad_output[j] * layer->weights[w_idx];
+            layer->grad_w[w_idx] += input[i] * grad_output[j];
         }
         if (grad_input) grad_input[i] = gi;
     }
 
     if (layer->use_bias) {
         for (size_t j = 0; j < layer->out_dim; j++) {
+            if (j >= layer->out_dim) break;
             layer->grad_b[j] += grad_output[j];
         }
     }
 
+    // Clamp gradients to prevent explosion
     for (size_t i = 0; i < layer->in_dim * layer->out_dim; i++) {
+        if (layer->grad_w[i] > 100.0f) layer->grad_w[i] = 100.0f;
+        if (layer->grad_w[i] < -100.0f) layer->grad_w[i] = -100.0f;
         layer->weights[i] -= lr * layer->grad_w[i];
         layer->grad_w[i] = 0.0f;
     }
     if (layer->use_bias) {
         for (size_t j = 0; j < layer->out_dim; j++) {
+            if (layer->grad_b[j] > 100.0f) layer->grad_b[j] = 100.0f;
+            if (layer->grad_b[j] < -100.0f) layer->grad_b[j] = -100.0f;
             layer->bias[j] -= lr * layer->grad_b[j];
             layer->grad_b[j] = 0.0f;
         }
@@ -237,25 +262,45 @@ void sgfnd_mlp_forward(const sgfnd_mlp_t *mlp, const float *input, float *output
 void sgfnd_mlp_backward(sgfnd_mlp_t *mlp, const float *input, const float *target, float lr) {
     if (!mlp || !input || !target) return;
 
-    float *grad = mlp->pre_activations;
-    size_t out_dim = mlp->layer_dims[mlp->num_layers];
+    size_t max_dim = 0;
+    for (size_t i = 0; i <= mlp->num_layers; i++) {
+        if (mlp->layer_dims[i] > max_dim) max_dim = mlp->layer_dims[i];
+    }
 
+    float *grad_out = calloc(max_dim, sizeof(float));
+    float *grad_in = calloc(max_dim, sizeof(float));
+    if (!grad_out || !grad_in) {
+        free(grad_out);
+        free(grad_in);
+        return;
+    }
+
+    size_t out_dim = mlp->layer_dims[mlp->num_layers];
     for (size_t i = 0; i < out_dim; i++) {
-        grad[i] = 2.0f * (mlp->activations[i] - target[i]);
+        grad_out[i] = 2.0f * (mlp->activations[i] - target[i]);
     }
 
     for (int i = mlp->num_layers - 1; i >= 0; i--) {
         float *layer_in = (i == 0) ? (float*)input : mlp->activations;
-        float *layer_out = (i == mlp->num_layers - 1) ? mlp->activations : mlp->pre_activations;
 
         if (i < mlp->num_layers - 1) {
-            for (size_t j = 0; j < mlp->layer_dims[i + 1]; j++) {
-                grad[j] *= silu_grad(mlp->pre_activations[j]);
+            size_t act_dim = mlp->layer_dims[i + 1];
+            for (size_t j = 0; j < act_dim; j++) {
+                grad_out[j] *= silu_grad(mlp->pre_activations[j]);
             }
         }
 
-        sgfnd_linear_backward(mlp->layers[i], layer_in, grad, (i > 0) ? grad : NULL, lr);
+        sgfnd_linear_backward(mlp->layers[i], layer_in, grad_out, (i > 0) ? grad_in : NULL, lr);
+
+        if (i > 0) {
+            size_t in_dim = mlp->layers[i]->in_dim;
+            memcpy(grad_out, grad_in, in_dim * sizeof(float));
+            memset(grad_in, 0, in_dim * sizeof(float));
+        }
     }
+
+    free(grad_out);
+    free(grad_in);
 }
 
 sgfnd_diffusion_t* sgfnd_diffusion_create(int num_timesteps, size_t latent_dim, size_t cond_dim) {
@@ -369,14 +414,22 @@ float sgfnd_diffusion_loss(const sgfnd_diffusion_t *diff, const float *x_0, cons
     if (!diff || !x_0 || !cond) return 0.0f;
 
     size_t latent_dim = diff->denoiser->layer_dims[0] - 512;
-    float *x_t = malloc(latent_dim * sizeof(float));
-    float *eps_pred = malloc(latent_dim * sizeof(float));
-    float *eps_true = malloc(latent_dim * sizeof(float));
+    float *x_t = calloc(latent_dim, sizeof(float));
+    float *eps_pred = calloc(latent_dim, sizeof(float));
+    float *eps_true = calloc(latent_dim, sizeof(float));
+    if (!x_t || !eps_pred || !eps_true) {
+        free(x_t);
+        free(eps_pred);
+        free(eps_true);
+        return 1e6f;
+    }
 
     for (size_t i = 0; i < latent_dim; i++) {
         eps_true[i] = randn();
         float alpha_cumprod = diff->alphas_cumprod[t];
-        x_t[i] = sqrtf(alpha_cumprod) * x_0[i] + sqrtf(1.0f - alpha_cumprod) * eps_true[i];
+        float sqrt_acp = sqrtf(fmaxf(0.0f, alpha_cumprod));
+        float sqrt_one_minus_acp = sqrtf(fmaxf(0.0f, 1.0f - alpha_cumprod));
+        x_t[i] = sqrt_acp * x_0[i] + sqrt_one_minus_acp * eps_true[i];
     }
 
     sgfnd_diffusion_forward(diff, x_t, t, cond, eps_pred);
@@ -384,9 +437,16 @@ float sgfnd_diffusion_loss(const sgfnd_diffusion_t *diff, const float *x_0, cons
     float loss = 0.0f;
     for (size_t i = 0; i < latent_dim; i++) {
         float diff_val = eps_pred[i] - eps_true[i];
+        // Clamp diff to prevent huge values
+        if (diff_val > 100.0f) diff_val = 100.0f;
+        if (diff_val < -100.0f) diff_val = -100.0f;
         loss += diff_val * diff_val;
     }
     loss /= latent_dim;
+
+    if (isnan(loss) || isinf(loss) || loss > 1e6f) {
+        loss = 1e6f;
+    }
 
     free(x_t);
     free(eps_pred);

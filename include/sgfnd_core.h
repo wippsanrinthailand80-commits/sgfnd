@@ -287,6 +287,7 @@ void sgfnd_prompt_destroy(sgfnd_prompt_t *prompt);
 sgfnd_image_t* sgfnd_image_load_from_file(const char *path, uint32_t max_dim);
 int sgfnd_image_resize(sgfnd_image_t *img, uint32_t new_width, uint32_t new_height);
 void sgfnd_image_normalize(sgfnd_image_t *img, float mean, float std);
+int sgfnd_image_validate_for_training(const sgfnd_image_t *img);
 
 sgfnd_dataset_t* sgfnd_dataset_create(uint32_t width, uint32_t height, size_t capacity);
 void sgfnd_dataset_destroy(sgfnd_dataset_t *dataset);
@@ -317,7 +318,9 @@ int sgfnd_nsfw_sanitize_image(sgfnd_nsfw_filter_t *filter, sgfnd_image_t *img);
 typedef struct sgfnd_training_bot sgfnd_training_bot_t;
 sgfnd_training_bot_t* sgfnd_training_bot_create_v2(const char *storage_path, sgfnd_dataset_t *dataset);
 void sgfnd_training_bot_destroy_v2(sgfnd_training_bot_t *bot);
-int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *url, sgfnd_model_t *model, sgfnd_color_grader_t *grader);
+int sgfnd_training_bot_fetch_and_train(sgfnd_training_bot_t *bot, const char *url, sgfnd_model_t *model, sgfnd_color_grader_t *grader, sgfnd_training_step_t *step_info);
+int sgfnd_training_bot_train_from_file(sgfnd_training_bot_t *bot, const char *filepath, sgfnd_model_t *model, sgfnd_color_grader_t *grader, sgfnd_training_step_t *step_info);
+int sgfnd_training_bot_train_from_directory(sgfnd_training_bot_t *bot, const char *dirpath, sgfnd_model_t *model, sgfnd_color_grader_t *grader, int epochs, int steps);
 int sgfnd_training_bot_augment_dataset(sgfnd_training_bot_t *bot, sgfnd_dataset_t *dataset);
 
 size_t sgfnd_training_bot_get_fetched(const sgfnd_training_bot_t *bot);
