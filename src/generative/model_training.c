@@ -20,10 +20,13 @@ sgfnd_model_t* sgfnd_model_create(size_t latent_dim, size_t cond_dim, int timest
     size_t encoder_dims[] = {latent_dim * 2, 512, 512, latent_dim * 2};
     model->encoder = sgfnd_mlp_create(encoder_dims, 4);
 
-    size_t decoder_dims[] = {latent_dim, 512, 512, latent_dim * 4};
-    model->decoder = sgfnd_mlp_create(decoder_dims, 4);
+    // Ultra-compact decoder for ARM: 64x64x4 = 16,384 output
+    // Minimal upsampling: latent -> 512 -> 2048 -> 8192 -> 16384
+    size_t decoder_dims[] = {latent_dim, 512, 2048, 8192, 16384};
+    model->decoder = sgfnd_mlp_create(decoder_dims, 5);
 
-    size_t disc_dims[] = {latent_dim * 4, 512, 256, 1};
+    // Discriminator for 64x64x4 = 16384
+    size_t disc_dims[] = {16384, 512, 128, 1};
     model->discriminator = sgfnd_mlp_create(disc_dims, 4);
 
     size_t opt_state_size = 0;
@@ -96,10 +99,11 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
 
     size_t latent_dim = model->latent->dim;
     size_t cond_dim = model->diffusion->cond_embed->layer_dims[0];
+    size_t image_size = 64 * 64 * 4; // 64x64 RGBA (ARM-friendly)
 
     float *latent_input = calloc(latent_dim * 2, sizeof(float));
     float *cond = calloc(cond_dim, sizeof(float));
-    float *recon = calloc(latent_dim * 4, sizeof(float));
+    float *recon = calloc(image_size, sizeof(float));
     float *disc_out = calloc(1, sizeof(float));
     if (!latent_input || !cond || !recon || !disc_out) {
         free(latent_input);
@@ -109,7 +113,20 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
         return -1;
     }
 
-    image_to_latent_input(img, latent_input);
+    // Create temporary resized image for training (64x64)
+    sgfnd_image_t *train_img = img;
+    sgfnd_image_t *resized_img = NULL;
+    if (img->width != 64 || img->height != 64) {
+        resized_img = sgfnd_image_create_tiled(64, 64, img->channels, 64);
+        if (resized_img) {
+            sgfnd_image_resize(resized_img, 64, 64);
+            // Keep [0, 1] range for SiLU decoder output compatibility
+            // Don't normalize to [-1, 1] since decoder uses SiLU (outputs >= 0)
+            train_img = resized_img;
+        }
+    }
+
+    image_to_latent_input(train_img, latent_input);
     // Initialize logvar part (second half) to -1.0 for stable KL
     for (size_t i = 0; i < latent_dim; i++) {
         latent_input[latent_dim + i] = -1.0f;
@@ -128,12 +145,25 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
     sgfnd_mlp_forward(model->decoder, model->latent->latent, recon);
 
     float recon_loss = 0.0f;
-    for (size_t i = 0; i < latent_dim * 4; i++) {
-        float target = (i < latent_dim * 2) ? latent_input[i] : 0.0f;
-        float diff = recon[i] - target;
-        recon_loss += diff * diff;
+    if (train_img->full_pixels) {
+        size_t train_size = 64 * 64 * 4;
+        for (size_t i = 0; i < 64 * 64 * 4; i++) {
+            float target = train_img->full_pixels[i];
+            float diff = recon[i] - target;
+            recon_loss += diff * diff;
+        }
+        recon_loss /= (64 * 64 * 4);
+    } else {
+        // Fallback to latent reconstruction
+        for (size_t i = 0; i < latent_dim * 4; i++) {
+            float target = (i < latent_dim * 2) ? latent_input[i] : 0.0f;
+            float diff = recon[i] - target;
+            recon_loss += diff * diff;
+        }
+        recon_loss /= (latent_dim * 4);
     }
-    recon_loss /= (latent_dim * 4);
+
+    if (recon_loss > 1e6f) recon_loss = 1e6f;
 
     float kl_loss = 0.0f;
     for (size_t i = 0; i < latent_dim; i++) {
@@ -147,7 +177,10 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
     float disc_val = fmaxf(1e-8f, fminf(1.0f - 1e-8f, disc_out[0]));
     float adv_loss = -logf(disc_val);
 
-    float total_loss = diff_loss + recon_loss + 0.1f * kl_loss + 0.01f * adv_loss;
+    float total_loss = diff_loss + 10.0f * recon_loss + 0.1f * kl_loss + 0.01f * adv_loss;
+
+    fprintf(stderr, "[TRAIN] Losses: total=%.4f diff=%.4f recon=%.4f kl=%.4f adv=%.4f\n", 
+            total_loss, diff_loss, recon_loss, kl_loss, adv_loss);
 
     // Clamp total loss to prevent instability
     if (isnan(total_loss) || isinf(total_loss)) {
@@ -158,14 +191,14 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
         total_loss = 1e6f;
     }
 
-    float *grad_recon = calloc(latent_dim * 4, sizeof(float));
-    for (size_t i = 0; i < latent_dim * 4; i++) {
-        float target = (i < latent_dim * 2) ? latent_input[i] : 0.0f;
+    float *grad_recon = calloc(image_size, sizeof(float));
+    for (size_t i = 0; i < image_size; i++) {
+        float target = train_img->full_pixels ? train_img->full_pixels[i] : ((i < latent_dim * 2) ? latent_input[i] : 0.0f);
         float diff = recon[i] - target;
         // Clip gradient
         if (diff > 100.0f) diff = 100.0f;
         if (diff < -100.0f) diff = -100.0f;
-        grad_recon[i] = 2.0f * diff / (latent_dim * 4);
+        grad_recon[i] = 2.0f * diff / image_size;
     }
     sgfnd_mlp_backward(model->decoder, model->latent->latent, grad_recon, model->learning_rate);
 
@@ -183,6 +216,10 @@ int sgfnd_model_train_step(sgfnd_model_t *model, const sgfnd_image_t *img, const
     free(disc_out);
     free(grad_recon);
     free(grad_disc);
+
+    if (resized_img) {
+        sgfnd_image_free(resized_img);
+    }
 
     model->step_count++;
 
@@ -204,6 +241,10 @@ int sgfnd_model_generate(sgfnd_model_t *model, const sgfnd_prompt_t *prompt, sgf
     size_t latent_dim = model->latent->dim;
     size_t cond_dim = model->diffusion->cond_embed->layer_dims[0];
     size_t decoder_out_dim = model->decoder->layer_dims[model->decoder->num_layers];
+    size_t decoder_w = 64;
+    size_t decoder_h = 64;
+    size_t decoder_c = 4;
+    size_t decoder_pixels = decoder_w * decoder_h * decoder_c;
 
     float *cond = calloc(cond_dim, sizeof(float));
     float *latent = calloc(latent_dim, sizeof(float));
@@ -225,10 +266,19 @@ int sgfnd_model_generate(sgfnd_model_t *model, const sgfnd_prompt_t *prompt, sgf
     }
     sgfnd_mlp_forward(model->decoder, latent, decoded);
 
+    // Debug: print decoder output stats
+    float dec_min = decoded[0], dec_max = decoded[0], dec_sum = 0;
+    for (size_t i = 0; i < decoder_out_dim; i++) {
+        if (decoded[i] < dec_min) dec_min = decoded[i];
+        if (decoded[i] > dec_max) dec_max = decoded[i];
+        dec_sum += decoded[i];
+    }
+    fprintf(stderr, "[GEN] Decoder output: min=%.4f max=%.4f mean=%.4f dim=%zu\n", 
+            dec_min, dec_max, dec_sum / decoder_out_dim, decoder_out_dim);
+
     uint32_t w = out_img->width;
     uint32_t h = out_img->height;
     uint8_t c = out_img->channels;
-    size_t pixels_per_channel = w * h;
     size_t total_pixels = w * h * c;
 
     if (!out_img->full_pixels) {
@@ -241,28 +291,34 @@ int sgfnd_model_generate(sgfnd_model_t *model, const sgfnd_prompt_t *prompt, sgf
         }
     }
 
-    size_t feature_per_pixel = decoder_out_dim / pixels_per_channel;
-    if (feature_per_pixel == 0) feature_per_pixel = 1;
-    if (feature_per_pixel > 4) feature_per_pixel = 4;
+    // Upscale 64x64 decoder output to target resolution using bilinear interpolation
+    float scale_x = (float)decoder_w / w;
+    float scale_y = (float)decoder_h / h;
 
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
-            size_t pixel_idx = y * w + x;
-            size_t decoded_idx = pixel_idx * feature_per_pixel;
-            size_t out_idx = (y * w + x) * c;
+            float src_x = x * scale_x;
+            float src_y = y * scale_y;
+            uint32_t x0 = (uint32_t)src_x;
+            uint32_t y0 = (uint32_t)src_y;
+            uint32_t x1 = fminf(decoder_w - 1, x0 + 1);
+            uint32_t y1 = fminf(decoder_h - 1, y0 + 1);
+            float fx = src_x - x0;
+            float fy = src_y - y0;
 
-            float r = (decoded_idx < decoder_out_dim) ? decoded[decoded_idx] : 0.0f;
-            float g = (decoded_idx + 1 < decoder_out_dim) ? decoded[decoded_idx + 1] : r * 0.85f;
-            float b = (decoded_idx + 2 < decoder_out_dim) ? decoded[decoded_idx + 2] : r * 0.7f;
+            for (uint8_t ch = 0; ch < c; ch++) {
+                float v00 = decoded[(y0 * decoder_w + x0) * decoder_c + ch];
+                float v10 = decoded[(y0 * decoder_w + x1) * decoder_c + ch];
+                float v01 = decoded[(y1 * decoder_w + x0) * decoder_c + ch];
+                float v11 = decoded[(y1 * decoder_w + x1) * decoder_c + ch];
 
-            r = fmaxf(0.0f, fminf(1.0f, r));
-            g = fmaxf(0.0f, fminf(1.0f, g));
-            b = fmaxf(0.0f, fminf(1.0f, b));
+                float v0 = v00 + fx * (v10 - v00);
+                float v1 = v01 + fx * (v11 - v01);
+                float v = v0 + fy * (v1 - v0);
 
-            out_img->full_pixels[out_idx + 0] = r;
-            out_img->full_pixels[out_idx + 1] = g;
-            out_img->full_pixels[out_idx + 2] = b;
-            if (c > 3) out_img->full_pixels[out_idx + 3] = 1.0f;
+                size_t out_idx = (y * w + x) * c + ch;
+                out_img->full_pixels[out_idx] = fmaxf(0.0f, fminf(1.0f, v));
+            }
         }
     }
 
